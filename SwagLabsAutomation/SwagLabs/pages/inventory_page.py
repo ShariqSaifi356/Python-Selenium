@@ -13,6 +13,7 @@ class InventoryPage(BasePage):
     item_price_path = (By.XPATH, "//div[@class='inventory_item_price']")
     menu_path = (By.XPATH, "//button[@id='react-burger-menu-btn']")
     logout_path = (By.XPATH, "//a[@id='logout_sidebar_link']")
+    inventory_title = (By.CLASS_NAME, "title")
 
     def add_product(self):
         self.click_btn(self.add_backpack)
@@ -54,6 +55,9 @@ class InventoryPage(BasePage):
     def login_page_url(self):
         url = "https://www.saucedemo.com/"
         return self.get_page_url(url)
+    
+    def is_inventory_page_visible(self):
+        return "Products" in self.get_text(self.inventory_title)
         
     
     
