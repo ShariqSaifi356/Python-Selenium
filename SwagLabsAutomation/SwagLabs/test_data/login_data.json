@@ -1,0 +1,19 @@
+{
+    "data": [
+        {
+            "username": "standard_user",
+            "password": "secret_sauce",
+            "firstname": "Rohan",
+            "lastname": "Kumar",
+            "pincode": "223344"
+        },
+
+        {
+            "username": "standard_user",
+            "password": "secret_sauce",
+            "firstname": "Akash",
+            "lastname": "Yadav",
+            "pincode": "221122"
+        }
+    ]
+}
