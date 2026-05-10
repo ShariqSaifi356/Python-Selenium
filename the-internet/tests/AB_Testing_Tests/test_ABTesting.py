@@ -8,3 +8,4 @@ def test_checkout_flow(setup):
     
     ab_page.openABTestingPage()
     
+    assert ab_page.visibilityOfElement() == True    

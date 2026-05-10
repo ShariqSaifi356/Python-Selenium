@@ -8,4 +8,7 @@ class BasePage:
         self.wait = WebDriverWait(driver, 10)
         
     def click_on_element(self, locator):
-        self.wait.until(EC.element_to_be_clickable(locator)).click()        
+        self.wait.until(EC.element_to_be_clickable(locator)).click()     
+        
+    def validate_element_of_page(self, locator):
+        return self.wait.until(EC.visibility_of_element_located(locator))
