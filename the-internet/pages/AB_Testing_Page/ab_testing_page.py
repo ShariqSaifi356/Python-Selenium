@@ -11,3 +11,6 @@ class ABTestingPage(BasePage):
         
     def visibilityOfElement(self):
         return self.validate_element_of_page(self.body_of_webpage).is_displayed()
+    
+    def url(self):
+        return self.get_page_url(self.driver.current_url)

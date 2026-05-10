@@ -12,3 +12,7 @@ class BasePage:
         
     def validate_element_of_page(self, locator):
         return self.wait.until(EC.visibility_of_element_located(locator))
+    
+    def get_page_url(self, url_of_webpage):
+        self.wait.until(EC.url_to_be(url_of_webpage))
+        return self.driver.current_url
