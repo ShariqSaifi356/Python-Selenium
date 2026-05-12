@@ -16,3 +16,6 @@ class BasePage:
     def get_page_url(self, url_of_webpage):
         self.wait.until(EC.url_to_be(url_of_webpage))
         return self.driver.current_url
+    
+    def get_text(self, locator):
+        return self.wait.until(EC.visibility_of_element_located(locator)).text
