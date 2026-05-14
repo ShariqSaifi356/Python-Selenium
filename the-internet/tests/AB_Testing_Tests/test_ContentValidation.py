@@ -8,3 +8,7 @@ def test_checkout_flow(setup):
     ab_page.openABTestingPage()    
     assert ab_page.paragraphOfABPage()
     assert ab_page.getParagraphTextofABPage() != ""
+    
+    expected_keywords = ["testing", "businesses", "simultaneously", "versions", "desired"]
+    for keyword in expected_keywords:
+        assert keyword in ab_page.containsExpectedKeywords()

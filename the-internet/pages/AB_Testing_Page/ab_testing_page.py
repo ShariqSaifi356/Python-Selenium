@@ -25,3 +25,8 @@ class ABTestingPage(BasePage):
     
     def getParagraphTextofABPage(self):
         return self.get_text(self.para)
+    
+    def containsExpectedKeywords(self):
+        text = self.get_text(self.para).lower()
+        return text
+    
