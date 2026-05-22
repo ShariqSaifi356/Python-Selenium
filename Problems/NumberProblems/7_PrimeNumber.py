@@ -12,7 +12,7 @@ def is_prime_1(num : int) -> bool:
 
 
 def is_prime_2(num : int) -> bool:
-       '''2. This method will check the given number is prime or not.'''
+       '''2. Optimize version - This method will check the given number is prime or not.'''
        
        c = 2
        if (num <= 1):
@@ -24,6 +24,29 @@ def is_prime_2(num : int) -> bool:
            c = c + 1
            
        return True
+   
+def is_prime_3(num : int) -> bool:
+        '''3. More Optimize version - This method will check the given number is prime or not.
+        In this method I am not considering even numbers, I am check for odds numbers only.
+        '''
+    
+        if num <= 1:
+            return False
+        
+        if num == 2:
+            return True
+        
+        if num % 2 == 0:
+            return False
+        
+        c = 3
+        
+        while c * c <= num:
+            if num % c == 0:
+                return False
+            c += 2
+        
+        return True
                
        
     
