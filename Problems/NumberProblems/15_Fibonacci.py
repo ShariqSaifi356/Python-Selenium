@@ -13,6 +13,8 @@ def fibonacci(num : int) -> int:
         return fibonacci(num-1) + fibonacci(num-2)
     
     
+    
+    
 # Function to print Fibonacci series
 def fibo_series(num: int):
 
@@ -37,5 +39,8 @@ def fibo_series(num: int):
     
     
 if __name__ == "__main__":
-    number = 9
-    print(fibo_series(number))
+    # number = 9
+    # print(fibo_series(number))
+    n = 10
+    for i in range(n):
+        print(fibonacci(i), end=" ")

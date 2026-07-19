@@ -1,0 +1,1536 @@
+================================================================================
+PYTHON INTERVIEW Q&A — DETAILED WITH INTERNAL WORKING
+================================================================================
+For SDET/QA Automation interview prep. Focus: not just definitions, but WHY/HOW
+things work under the hood, so you can answer follow-up "how does that work
+internally" questions confidently.
+
+================================================================================
+Q1. Key differences between Python 2 and Python 3
+================================================================================
+Internally these aren't cosmetic — they reflect changes to the core data model.
+
+1. print: Py2 print is a STATEMENT (parsed specially by the grammar, no parens
+   needed). Py3 print is a FUNCTION — a real callable in builtins. That's why
+   print "x" works in Py2 but throws SyntaxError in Py3 — the parser literally
+   doesn't recognize that grammar rule anymore.
+
+2. Integer division: Py2 `5/2` = 2 (truncating int division by default, calls
+   int.__div__). Py3 `5/2` = 2.5 (true division, calls __truediv__); `5//2`
+   gives floor division explicitly via __floordiv__. Py3 added a separate
+   dunder method so the two semantics don't collide.
+
+3. Strings: Py2 `str` is a byte sequence (ASCII/bytes by default), `unicode`
+   is a separate type for text. Py3 unified this — `str` is ALWAYS Unicode
+   internally (stored as a sequence of code points, with the interpreter
+   picking the most compact internal representation: 1, 2, or 4 bytes per
+   char depending on the max code point — this is called "flexible string
+   representation", PEP 393). `bytes` is now the separate raw-byte type. This
+   is why Py2->Py3 porting often breaks on implicit str/bytes mixing — Py3
+   refuses to silently coerce between them.
+
+4. Integers: Py2 has `int` (fixed-size, overflows to `long`) and `long`
+   (arbitrary precision). Py3 merged them into one `int` type that is always
+   arbitrary-precision under the hood (implemented as an array of "digits" in
+   base 2^30, growing as needed) — no manual long suffix needed.
+
+5. range(): Py2 `range()` builds a full list in memory immediately; `xrange()`
+   was the lazy version. Py3 `range()` IS the lazy version — it returns a
+   range object that computes start+i*step on indexing instead of storing all
+   values, so range(10**9) is O(1) memory in Py3 but O(n) in Py2.
+
+6. Exception syntax: Py2 `except Exception, e:` vs Py3 `except Exception as e:`
+   — Py3 enforces `as` to avoid ambiguity with tuple-of-exceptions syntax.
+
+7. Iterators: dict.keys()/values()/items(), map(), filter(), zip() return
+   actual lists in Py2, but VIEW/ITERATOR objects in Py3 (lazy, memory
+   efficient, reflect live changes to the underlying dict for views).
+
+Bottom line for interviews: Py3's changes mostly aim at memory efficiency
+(range, views) and removing implicit/ambiguous type coercion (str/bytes,
+division). Py2 reached EOL Jan 1, 2020.
+
+================================================================================
+Q2. Mutable vs Immutable data types (with internal explanation)
+================================================================================
+Every Python object has 3 things in its header (CPython implementation):
+refcount, type pointer, and value. "Mutable" means the VALUE at a fixed
+memory address (id()) can change in place. "Immutable" means once created,
+that object's value can never change — any "change" actually creates a NEW
+object.
+
+Immutable: int, float, bool, str, tuple, frozenset, bytes.
+Mutable: list, dict, set, bytearray, custom objects (by default).
+
+    x = 5
+    print(id(x))      # some address, say 1001
+    x = x + 1
+    print(id(x))       # DIFFERENT address — a new int object was created,
+                        # x is just rebound to point to it
+
+    lst = [1, 2, 3]
+    print(id(lst))      # address A
+    lst.append(4)
+    print(id(lst))       # SAME address A — list mutated in place
+
+Why it matters in real code:
+- Mutable default arguments bug: `def f(x, cache=[])` — the list is created
+  ONCE at function-definition time and reused across all calls since default
+  args are evaluated once and stored on the function object (__defaults__).
+  This causes the classic "growing list" bug. Fix: use `cache=None` and
+  `cache = cache or []` inside.
+- Immutable objects are hashable (if __hash__ is defined) so they can be
+  dict keys / set members — because their hash value is guaranteed never to
+  change during their lifetime, which a hash table relies on. That's why
+  list can't be a dict key but tuple can (as long as it contains only
+  immutable elements — `(1,[2,3])` is still unhashable because the nested
+  list is mutable).
+- Small int caching: CPython pre-creates and caches small ints (-5 to 256)
+  at startup, so `a = 5; b = 5` gives `a is b` True (same cached object).
+  This is a CPython implementation detail, not a language guarantee.
+
+================================================================================
+Q3. list vs tuple vs set vs dict — internal differences
+================================================================================
+list:  Mutable, ordered, allows duplicates. Internally a dynamic array of
+       pointers (PyObject*). Over-allocates capacity on growth (similar to
+       Java ArrayList/C++ vector amortized doubling) so append() is O(1)
+       amortized, but insert(0, x) is O(n) because everything shifts.
+
+tuple: Immutable, ordered, allows duplicates. Fixed-size array of pointers,
+       allocated exactly once at creation — no extra capacity, so tuples use
+       less memory than lists of the same length and are slightly faster to
+       create/iterate. Used for fixed records (Hint: function returns
+       multiple values via a tuple).
+
+set:   Mutable, UNORDERED, no duplicates. Implemented as a hash table (like
+       dict but storing only keys, no values). Membership test `x in s` is
+       O(1) average (hash lookup) vs O(n) for list/tuple (linear scan) — this
+       is the single biggest interview point: "why use a set instead of a
+       list for membership checks" -> hashing.
+
+dict:  Mutable, insertion-ordered (guaranteed since Py3.7), key-value pairs,
+       keys must be hashable. Implemented as an open-addressing hash table.
+       CPython since 3.6 added a "compact dict" layout: a dense array stores
+       entries in insertion order, and a separate sparse hash table stores
+       indices into that array — this is WHY ordering became a guaranteed
+       side effect of the new implementation before it became official
+       language spec in 3.7.
+
+Hash collision handling (set/dict): when two keys hash to the same bucket,
+CPython uses open addressing with perturbation (not chaining like Java
+HashMap) — it probes a pseudo-random sequence of other slots until it finds
+a free one.
+
+Quick decision table for interviews:
+- Need order + duplicates + mutability -> list
+- Need order + duplicates + immutability/fixed record -> tuple
+- Need uniqueness + fast membership test -> set
+- Need key->value mapping -> dict
+
+================================================================================
+Q4. *args and **kwargs
+================================================================================
+These let a function accept a variable number of positional/keyword
+arguments. Internally:
+
+- `*args` collects extra positional args into a TUPLE inside the function.
+- `**kwargs` collects extra keyword args into a DICT inside the function.
+
+    def f(*args, **kwargs):
+        print(args)     # tuple, e.g. (1, 2, 3)
+        print(kwargs)   # dict, e.g. {'a': 1, 'b': 2}
+
+    f(1, 2, 3, a=1, b=2)
+
+The `*` and `**` are also used at the CALL site to do the reverse —
+"unpacking" a sequence/dict into individual arguments:
+
+    def add(a, b, c): return a+b+c
+    nums = [1, 2, 3]
+    add(*nums)            # unpacks list into 3 positional args
+    d = {'a':1,'b':2,'c':3}
+    add(**d)              # unpacks dict into keyword args (key names must
+                           # match parameter names)
+
+Internally, when Python compiles a function with *args/**kwargs, the code
+object's `co_flags` get CO_VARARGS / CO_VARKEYWORDS bits set, and the
+function's argument-binding logic (in ceval.c for CPython) knows to scoop up
+any leftover positional/keyword arguments into these containers instead of
+raising TypeError for "too many arguments."
+
+Where I've used it in automation:
+- Generic wrapper/decorator functions that need to forward arbitrary
+  arguments to the wrapped function, e.g. a retry decorator:
+    def retry(func):
+        def wrapper(*args, **kwargs):
+            for _ in range(3):
+                try:
+                    return func(*args, **kwargs)
+                except Exception:
+                    continue
+            raise
+        return wrapper
+- Page Object methods/helper utilities that wrap Selenium calls and need to
+  pass through variable locator/extra options without rewriting the
+  signature every time.
+
+================================================================================
+Q5. Deep copy vs Shallow copy
+================================================================================
+Both come from the `copy` module. The difference is about how nested mutable
+objects are handled.
+
+Shallow copy (`copy.copy()` or `list[:]`, `dict.copy()`):
+Creates a NEW outer container, but the elements inside are the SAME object
+references as the original (not copied). So if an inner element is mutable,
+mutating it through either copy affects both.
+
+    import copy
+    a = [[1, 2], [3, 4]]
+    b = copy.copy(a)
+    b[0].append(99)
+    print(a)   # [[1, 2, 99], [3, 4]]  <- original changed too!
+    print(a is b)        # False (different outer list)
+    print(a[0] is b[0])   # True  (same inner list object)
+
+Deep copy (`copy.deepcopy()`):
+Recursively copies EVERY nested object, building an entirely independent
+object graph. Internally it walks the object using a `memo` dictionary
+(keyed by id() of already-copied objects) to handle circular references
+without infinite recursion (if object A contains a reference to itself,
+deepcopy detects it's already in `memo` and reuses the new copy instead of
+looping forever).
+
+    c = copy.deepcopy(a)
+    c[0].append(100)
+    print(a)   # unaffected
+
+Performance note: deepcopy is significantly slower because it recursively
+copies the entire structure — use shallow copy when you know nested elements
+are immutable or you intentionally want shared references.
+
+================================================================================
+Q6. GIL (Global Interpreter Lock)
+================================================================================
+The GIL is a mutex in CPython (the standard/reference implementation) that
+allows only ONE thread to execute Python bytecode at a time, even on a
+multi-core machine.
+
+WHY it exists: CPython's memory management (specifically reference counting
+for garbage collection) is NOT thread-safe by default. If two threads
+incremented/decremented an object's refcount simultaneously without a lock,
+you'd get race conditions causing memory corruption or premature frees. The
+GIL was the simplest solution when CPython was designed — one global lock
+protecting all interpreter state instead of fine-grained locks on every
+object.
+
+How it actually behaves:
+- A thread holds the GIL while running bytecode, and releases it
+  periodically (CPython switches based on a configurable instruction-count/
+  time interval, sys.setswitchinterval(), default ~5ms) or whenever it does
+  a blocking I/O call (file read, network call, time.sleep) — I/O operations
+  release the GIL explicitly so other threads can run during the wait.
+- This means: for I/O-bound work, `threading` module gives real concurrency
+  benefit (while one thread blocks on a socket, another runs Python code).
+- For CPU-bound work, threading gives NO speedup (often a slight slowdown
+  due to lock contention/context switch overhead) because only one thread
+  ever executes Python bytecode at a time, regardless of core count.
+
+Workarounds for CPU-bound parallelism:
+- `multiprocessing` module: spawns separate OS PROCESSES, each with its own
+  Python interpreter and its own GIL — true parallel execution across cores,
+  at the cost of higher memory and inter-process communication overhead
+  (pickling data between processes).
+- Releasing the GIL in C extensions (numpy, etc. do heavy computation in C
+  and release the GIL during that block).
+- PEP 703 (Python 3.13+) introduced an experimental "free-threaded" build of
+  CPython without a GIL — worth mentioning as awareness of where the
+  language is headed, but not the default build.
+
+Relevance to automation/SDET: this matters when designing parallel test
+execution — e.g. why pytest-xdist uses multiple PROCESSES (-n auto) rather
+than threads to genuinely parallelize CPU-heavy test work, while threads
+remain fine for I/O-bound waits like network calls during API testing.
+
+================================================================================
+Q7. List comprehension vs Generator expression
+================================================================================
+List comprehension: `[x*x for x in range(10)]` — evaluates EAGERLY, builds
+the entire list in memory immediately, returns a list object.
+
+Generator expression: `(x*x for x in range(10))` — evaluates LAZILY. Returns
+a generator object immediately (almost instant, no computation happens yet).
+Each value is computed ON DEMAND when you call next() on it (explicitly or
+implicitly via a for-loop/sum()/etc).
+
+Internal mechanism: a generator expression compiles to a special code object
+that, when called, returns a generator — an object that holds a FRAME
+(execution state: local variables, the instruction pointer/where it paused).
+Calling next() resumes that frame from exactly where it left off (right
+after the last yielded value) until the next value is produced or
+StopIteration is raised when exhausted.
+
+    gen = (x*x for x in range(5))
+    next(gen)   # 0   - frame starts, runs to first yield-equivalent point
+    next(gen)   # 1   - frame resumes from where it paused
+
+Memory comparison: list comp for range(10**8) allocates ~100M ints worth of
+memory upfront. Generator expression for the same uses near-constant memory
+(only stores loop state) — values are produced one at a time and can be
+garbage collected after use if not retained elsewhere.
+
+When to use which:
+- Use list comprehension when you need to: index into results, iterate
+  multiple times, or need len().
+- Use generator expression when: processing large/streaming data, only need
+  to iterate once, or feeding directly into sum()/max()/any()/a for-loop
+  where you never need the whole collection materialized.
+
+================================================================================
+Q8. `is` vs `==`
+================================================================================
+`==` calls the `__eq__` method — checks VALUE equality (are the contents
+logically equal).
+`is` checks IDENTITY — are both names pointing to the exact SAME object in
+memory (compares id(a) == id(b) internally, i.e., same memory address).
+
+    a = [1, 2, 3]
+    b = [1, 2, 3]
+    print(a == b)   # True  - same contents
+    print(a is b)   # False - two different list objects in memory
+
+    c = a
+    print(a is c)   # True - c is just another name for the same object
+
+Gotcha with small int/string caching (CPython implementation detail, NOT
+guaranteed by the language spec): small ints (-5 to 256) and some short
+strings are interned/cached, so `a = 100; b = 100; a is b` may be True, but
+`a = 1000; b = 1000; a is b` is often False (not cached) — never rely on
+`is` for value comparisons because this caching behavior isn't guaranteed
+across implementations or versions.
+
+Rule of thumb: use `is` only for comparing against singletons — `None`,
+`True`, `False` (`if x is None`, not `if x == None`) — because there is
+exactly ONE None object in the entire process, so identity check is both
+correct and faster (no method call/dispatch overhead, just a pointer
+comparison).
+
+================================================================================
+Q9. Decorators (and writing a custom one)
+================================================================================
+A decorator is a function that takes another function/class as input and
+returns a new function/class — typically wrapping the original to add
+behavior (logging, timing, retries, validation) WITHOUT modifying its source
+code.
+
+The `@decorator` syntax is pure syntactic sugar:
+
+    @my_decorator
+    def foo(): ...
+
+is exactly equivalent to:
+
+    def foo(): ...
+    foo = my_decorator(foo)
+
+Internal mechanism — CLOSURES: the decorator typically defines an inner
+`wrapper` function that "closes over" (remembers) the original function via
+a free variable, even after the outer decorator function has returned. This
+is possible because Python functions carry a `__closure__` attribute — a
+tuple of cell objects holding references to the enclosing scope's variables
+that the inner function uses.
+
+Custom decorator example (timing + logging, common in automation):
+
+    import time
+    import functools
+
+    def log_execution_time(func):
+        @functools.wraps(func)     # preserves func.__name__/__doc__ -
+                                    # without this, foo.__name__ would become
+                                    # 'wrapper' which breaks introspection,
+                                    # pytest test discovery/reporting, etc.
+        def wrapper(*args, **kwargs):
+            start = time.time()
+            result = func(*args, **kwargs)
+            elapsed = time.time() - start
+            print(f"{func.__name__} took {elapsed:.3f}s")
+            return result
+        return wrapper
+
+    @log_execution_time
+    def test_login():
+        ...
+
+Decorator with arguments (an extra outer layer of function nesting):
+
+    def retry(times=3):
+        def decorator(func):
+            @functools.wraps(func)
+            def wrapper(*args, **kwargs):
+                last_exc = None
+                for _ in range(times):
+                    try:
+                        return func(*args, **kwargs)
+                    except Exception as e:
+                        last_exc = e
+                raise last_exc
+            return wrapper
+        return decorator
+
+    @retry(times=5)
+    def flaky_api_call(): ...
+
+Used heavily in test automation: pytest's own @pytest.fixture,
+@pytest.mark.parametrize are decorators built on this exact mechanism.
+
+================================================================================
+Q10. Lambda functions (and use in automation)
+================================================================================
+A lambda is an anonymous, single-expression function: `lambda x: x + 1`.
+Internally it compiles to a regular function object (a code object with no
+name beyond the placeholder `<lambda>`) — there's no separate "lambda type",
+it's syntactic sugar for defining a function inline without `def`. It can
+only contain a single EXPRESSION (no statements, no multi-line logic, no
+assignment via `=` although walrus `:=` is allowed inside).
+
+Restriction reasoning: this is a deliberate language design choice to keep
+lambdas simple/throwaway — for anything needing multiple statements, a
+proper `def` function is clearer and should be used instead.
+
+Used in automation for:
+- Sort keys: `sorted(elements, key=lambda e: e.get_attribute('data-order'))`
+  when sorting Selenium WebElements by a custom criterion.
+- Inline filtering: `list(filter(lambda x: x.is_displayed(), elements))` to
+  get only visible elements from a list located by a single locator.
+- Wait conditions with Selenium's WebDriverWait + expected_conditions, where
+  a lambda is passed as a custom condition function:
+    WebDriverWait(driver, 10).until(lambda d: d.find_element(By.ID, "x").is_enabled())
+- Quick key functions for `max()/min()` when picking, e.g., the longest text
+  among a list of elements.
+
+================================================================================
+Q11. map() vs filter() vs reduce()
+================================================================================
+All three are functional-programming tools that operate on iterables, each
+returning a different shape of result.
+
+map(func, iterable): applies func to EVERY element, returns a map object
+(an ITERATOR — lazy, computed one item at a time on each next() call).
+    list(map(lambda x: x*2, [1,2,3]))   # [2, 4, 6]
+
+filter(func, iterable): keeps only elements where func(elem) is truthy,
+returns a filter object (also a lazy iterator).
+    list(filter(lambda x: x % 2 == 0, [1,2,3,4]))   # [2, 4]
+
+reduce(func, iterable, [initial]) — from functools, NOT a builtin in Py3
+(was builtin in Py2, deliberately moved to functools to discourage overuse
+since comprehensions are usually more readable). It cumulatively applies a
+two-argument function, "reducing" the whole iterable to a SINGLE value by
+carrying an accumulator forward.
+    from functools import reduce
+    reduce(lambda acc, x: acc + x, [1,2,3,4])   # ((1+2)+3)+4 = 10
+
+Internally, reduce is roughly equivalent to:
+    def reduce(func, iterable, initial=_sentinel):
+        it = iter(iterable)
+        acc = initial if initial is not _sentinel else next(it)
+        for x in it:
+            acc = func(acc, x)
+        return acc
+
+In modern Python, list/dict/set comprehensions or built-in sum()/any()/all()
+are generally preferred over map/filter/reduce for readability — but
+interviewers still expect you to know how they work and the laziness
+distinction (map/filter return iterators, not lists, in Py3).
+
+================================================================================
+Q12. Module vs Package
+================================================================================
+Module: a single `.py` file. Importing it (`import mymodule`) runs the file
+top-to-bottom ONCE, caches the resulting module object in `sys.modules`
+keyed by name, and binds that object to the name in your namespace. Any
+subsequent `import mymodule` anywhere in the program just returns the
+ALREADY-CACHED object instead of re-executing the file — this is why
+module-level code (e.g. print statements, DB connections) runs only once no
+matter how many places import it.
+
+Package: a DIRECTORY of modules that Python treats as a single importable
+namespace, identified by containing an `__init__.py` file (in modern Python
+3.3+, "namespace packages" without __init__.py are also supported, but
+the explicit __init__.py form is still the common/explicit pattern,
+especially in test frameworks). `__init__.py` runs when the package is first
+imported and can be empty or used to control what's exposed at the package
+level (e.g. re-exporting submodule classes so users can `from mypkg import
+MyClass` instead of `from mypkg.submodule import MyClass`).
+
+Example layout in a typical automation framework:
+    framework/
+        __init__.py
+        pages/
+            __init__.py
+            login_page.py      <- module, contains class LoginPage
+            dashboard_page.py
+        utils/
+            __init__.py
+            driver_factory.py
+
+`from framework.pages.login_page import LoginPage` — `framework`, `pages`
+are packages; `login_page` is a module; `LoginPage` is a class inside it.
+
+================================================================================
+Q13. Python's data types (brief but complete)
+================================================================================
+Numeric: int (arbitrary precision), float (C double, 64-bit IEEE 754),
+complex (a+bj).
+Sequence: str (immutable Unicode text), list (mutable), tuple (immutable),
+range (lazy immutable sequence of ints).
+Set: set (mutable, hashable elements only), frozenset (immutable version,
+itself hashable so it CAN be used as a dict key/set element).
+Mapping: dict (key-value, keys must be hashable).
+Boolean: bool — technically a SUBCLASS of int (True == 1, False == 0;
+`isinstance(True, int)` is True) — historical reason: booleans were added in
+Py2.3 by subclassing int rather than creating an entirely separate type, for
+backward compatibility with code that used 0/1 as booleans.
+Binary: bytes (immutable), bytearray (mutable), memoryview (a view over
+another object's buffer without copying — used for efficient binary data
+slicing).
+NoneType: `None`, the single singleton representing absence of a value.
+
+================================================================================
+Q14. Exception handling — try / except / else / finally
+================================================================================
+    try:
+        result = risky_call()
+    except ValueError as e:
+        # runs only if a ValueError (or subclass) is raised in try block
+        handle(e)
+    else:
+        # runs ONLY IF the try block completed with NO exception
+        # (often misunderstood — many think it's redundant with code after
+        # try/except, but its purpose is to separate "code that might raise"
+        # from "code that should run only on success", keeping the except
+        # blocks focused on just the risky call)
+        process(result)
+    finally:
+        # ALWAYS runs - exception or not, even if there's a return/break in
+        # try or except. Used for cleanup: closing files, quitting
+        # webdriver, releasing DB connections.
+        cleanup()
+
+Internal mechanism: CPython implements try/except using a block stack in
+the frame — when an exception is raised, the interpreter unwinds the call
+stack frame by frame, at each level checking if there's an active
+"exception handler" block whose except clause type matches
+(via `isinstance` check against the raised exception, walking the MRO) —
+the first matching except block "catches" it; if none match anywhere up the
+stack, the exception propagates to the top and terminates the program
+printing a traceback. `finally` blocks are guaranteed to execute during this
+unwinding via special bytecode (SETUP_FINALLY) that ensures cleanup code
+runs even if the exception isn't caught.
+
+Selenium/automation-relevant pattern:
+    driver = webdriver.Chrome()
+    try:
+        driver.get(url)
+        login(driver)
+    except TimeoutException as e:
+        logger.error(f"Login timed out: {e}")
+        raise
+    finally:
+        driver.quit()    # ensures browser closes even on failure
+
+================================================================================
+Q15. Handling multiple exceptions
+================================================================================
+Three patterns:
+
+1. Multiple except blocks (different handling per type):
+    try:
+        ...
+    except ValueError:
+        handle_value_error()
+    except KeyError:
+        handle_key_error()
+
+2. Single except catching a tuple of types (same handling for several):
+    try:
+        ...
+    except (ValueError, TypeError, KeyError) as e:
+        log(e)
+
+3. Catching a broad parent + specific child — ORDER MATTERS. Python checks
+   except clauses top-to-bottom and uses the FIRST match, so specific
+   exceptions must come BEFORE general ones:
+    try:
+        ...
+    except ZeroDivisionError:
+        ...               # must come first - more specific
+    except ArithmeticError:
+        ...               # ZeroDivisionError is a subclass of this
+    except Exception:
+        ...               # catch-all, must be LAST
+
+If you put `except Exception` first, it would swallow ZeroDivisionError too
+since ZeroDivisionError IS an Exception (matching uses isinstance/MRO walk),
+and the more specific block below would become unreachable dead code.
+
+================================================================================
+Q16. append() vs extend()
+================================================================================
+append(x): adds x as a SINGLE element at the end of the list — regardless
+of whether x is itself a list. List length increases by exactly 1.
+    a = [1, 2]
+    a.append([3, 4])
+    # a = [1, 2, [3, 4]]   <- nested list added as ONE element
+
+extend(iterable): iterates over the argument and adds each of ITS elements
+individually to the end. List length increases by len(iterable).
+    a = [1, 2]
+    a.extend([3, 4])
+    # a = [1, 2, 3, 4]
+
+Internally, extend is roughly equivalent to a loop calling append for each
+item in the iterable, but CPython implements it as a single optimized C-level
+operation (resizes the underlying array once based on a length estimate
+where possible, rather than potentially resizing on every single append),
+making `a.extend(b)` faster than `for x in b: a.append(x)` for large b.
+
+`a += [3, 4]` on a list behaves like extend (in-place, mutates), while
+`a = a + [3, 4]` creates a brand NEW list (different id()) — a subtle but
+real interview gotcha.
+
+================================================================================
+Q17. staticmethod vs classmethod vs instance method
+================================================================================
+Instance method (default, no decorator): first parameter is `self`, bound
+automatically to the instance it was called on. Internally, when you access
+`obj.method`, Python's descriptor protocol kicks in — functions are
+descriptors, and accessing a function through an instance returns a "bound
+method" object that automatically passes the instance as the first argument
+when called.
+
+classmethod (@classmethod): first parameter is `cls`, bound to the CLASS
+(not instance) regardless of whether called via the class or an instance.
+Commonly used for alternative constructors:
+    class User:
+        def __init__(self, name):
+            self.name = name
+        @classmethod
+        def from_dict(cls, data):
+            return cls(data['name'])     # cls() lets subclasses override
+                                          # the constructor used too
+
+staticmethod (@staticmethod): takes NO automatic first argument at all — it's
+just a regular function namespaced inside the class for organizational
+purposes; doesn't need access to self or cls.
+    class MathUtils:
+        @staticmethod
+        def add(a, b):
+            return a + b
+
+Why this matters internally: all three are different DESCRIPTOR types.
+A plain function in a class body becomes a "function descriptor" that
+creates bound methods on instance access. `classmethod` and `staticmethod`
+are built-in descriptor classes that override `__get__` differently — class
+method's __get__ always binds to the class (type(instance) if accessed via
+instance), staticmethod's __get__ just returns the plain function unbound.
+
+================================================================================
+Q18. __init__ vs __new__
+================================================================================
+`__new__(cls, ...)` is the actual OBJECT CONSTRUCTOR — it's a staticmethod
+(implicitly) responsible for ALLOCATING and returning a new instance (memory
+allocation). It runs FIRST.
+
+`__init__(self, ...)` is the INITIALIZER — it receives the already-created
+instance (as `self`) and sets up its attributes/state. It runs SECOND, only
+if __new__ actually returned an instance of the class (or subclass).
+
+    class Foo:
+        def __new__(cls, *args, **kwargs):
+            print("creating instance")
+            instance = super().__new__(cls)
+            return instance
+        def __init__(self, x):
+            print("initializing instance")
+            self.x = x
+
+    f = Foo(5)
+    # prints: creating instance
+    #         initializing instance
+
+When you'd actually override __new__ (rare in normal app code, common in
+frameworks): implementing SINGLETONS (return the same cached instance every
+time instead of creating a new one), or subclassing IMMUTABLE types like
+str/tuple/int where you must set the value DURING creation since __init__
+runs after the (already immutable) object exists and can't modify it
+anymore:
+
+    class UpperStr(str):
+        def __new__(cls, value):
+            return super().__new__(cls, value.upper())
+
+This is a common "trick question" in interviews — they want to hear that
+__new__ controls creation, __init__ controls initialization, and that's
+WHY immutable-type subclassing needs __new__.
+
+================================================================================
+Q19. Virtual environments — what and why
+================================================================================
+A virtual environment is an ISOLATED Python installation directory
+(`venv`/`virtualenv`) that has its own `site-packages` folder, separate from
+the global/system Python. Internally, it works by:
+1. Copying or symlinking the Python interpreter binary into the venv's
+   bin/Scripts folder.
+2. Creating a `pyvenv.cfg` file recording the base interpreter path.
+3. Modifying `sys.path` (via site.py logic at interpreter startup) so that
+   when this specific interpreter binary runs, it looks for packages in the
+   venv's local `site-packages` FIRST, isolated from the global one.
+4. `activate` script just prepends the venv's bin directory to your shell's
+   PATH so typing `python`/`pip` resolves to the venv's copies instead of
+   the system ones.
+
+Why used: different projects often need different (sometimes conflicting)
+versions of the same library — e.g. Project A needs `selenium==4.1`, Project
+B needs `selenium==4.20`. Without isolation, installing one would break the
+other since there'd be only one global site-packages. Also avoids polluting/
+needing admin rights on the system Python, and makes `requirements.txt`
+reproducible/portable across machines and CI pipelines.
+
+    python -m venv myenv
+    source myenv/bin/activate     # Linux/Mac
+    myenv\Scripts\activate        # Windows
+    pip install -r requirements.txt
+
+In CI/CD for automation frameworks, every pipeline run typically creates a
+fresh venv to guarantee a clean, reproducible dependency set rather than
+relying on whatever happens to be globally installed on the runner.
+
+================================================================================
+Q20. Python memory management & garbage collection
+================================================================================
+Two mechanisms work together in CPython:
+
+1. REFERENCE COUNTING (primary mechanism): every object has a refcount field
+   in its header. It increments whenever a new reference is made (assignment,
+   passing to a function, storing in a container) and decrements when a
+   reference goes out of scope/is deleted/reassigned. The moment an object's
+   refcount hits ZERO, CPython deallocates it IMMEDIATELY (not on some later
+   GC pass) — this is why CPython tends to free unused objects very
+   promptly/deterministically compared to some other GC'd languages.
+   `sys.getrefcount(obj)` lets you inspect this (note: it itself temporarily
+   adds 1 ref for the call).
+
+2. GENERATIONAL GARBAGE COLLECTOR (handles what refcounting CAN'T): pure
+   reference counting fails for CIRCULAR references — e.g. object A holds a
+   reference to B, and B holds a reference back to A; even if nothing else
+   in the program references either, their mutual refcounts never drop to 0.
+   The `gc` module periodically scans for such reference cycles using a
+   mark-and-sweep style algorithm specifically looking at "container" objects
+   (lists, dicts, class instances, etc. — anything that can hold references
+   to other objects) and reclaims unreachable cycles.
+   Optimization: it organizes objects into 3 "generations" (gen0 = newest,
+   gen2 = oldest/longest-lived). New objects start in gen0; gen0 is scanned
+   most frequently (cheap, since most garbage is short-lived); objects that
+   survive a scan get promoted to the next generation, which is scanned less
+   often — this avoids repeatedly re-scanning long-lived objects that are
+   probably still in use.
+
+Practically: you rarely need to call `gc.collect()` manually, but knowing
+this matters for diagnosing memory leaks in long-running test suites (e.g.
+WebDriver/page object instances holding circular references to each other
+preventing prompt cleanup, or large fixture-scoped objects not being
+released between tests because something still references them).
+
+================================================================================
+Q21. Monkey patching
+================================================================================
+Monkey patching = modifying or extending a class/module/object's behavior at
+RUNTIME, by directly reassigning its attributes/methods, WITHOUT touching
+the original source code. Possible because in Python almost everything
+(classes, modules, functions) is a mutable object whose attributes can be
+reassigned dynamically — there's no true "compile-time sealing."
+
+    # original
+    class APIClient:
+        def get_token(self):
+            return "real_token"
+
+    # monkey patch in a test file
+    def fake_get_token(self):
+        return "mocked_token"
+
+    APIClient.get_token = fake_get_token
+    client = APIClient()
+    print(client.get_token())   # "mocked_token"
+
+Real automation usage: pytest's built-in `monkeypatch` fixture is literally
+this concept formalized with automatic teardown/restoration after each test
+— e.g. patching `os.environ`, replacing a function that hits a real
+external API with a stub during a unit test, or patching `time.sleep` to a
+no-op to make tests run instantly instead of waiting for real delays.
+
+    def test_something(monkeypatch):
+        monkeypatch.setattr(APIClient, "get_token", fake_get_token)
+        ...
+        # automatically reverted after the test, unlike manual patching
+
+Risk: monkey patching is powerful but can make code hard to reason about/
+debug since behavior diverges silently from the original source — use it
+deliberately (mocking in tests) rather than as a general design pattern in
+production code.
+
+================================================================================
+Q22. == vs __eq__
+================================================================================
+`==` is the operator; Python translates `a == b` into a call to
+`a.__eq__(b)` (and if that returns `NotImplemented`, it tries
+`b.__eq__(a)` as a fallback — this is how comparisons between different but
+compatible types can still work both directions).
+
+By default, a custom class inherits `__eq__` from `object`, which falls back
+to identity comparison (`is`) — meaning two instances with identical
+attribute values are NOT equal by default unless you override `__eq__`:
+
+    class Point:
+        def __init__(self, x, y):
+            self.x, self.y = x, y
+
+    p1, p2 = Point(1,2), Point(1,2)
+    print(p1 == p2)   # False! default __eq__ falls back to identity
+
+    class Point2:
+        def __init__(self, x, y):
+            self.x, self.y = x, y
+        def __eq__(self, other):
+            if not isinstance(other, Point2):
+                return NotImplemented
+            return self.x == other.x and self.y == other.y
+
+    p3, p4 = Point2(1,2), Point2(1,2)
+    print(p3 == p4)   # True - now uses our value-based logic
+
+Important coupling: if you override `__eq__`, Python AUTOMATICALLY sets
+`__hash__` to None (making instances unhashable) unless you also explicitly
+define `__hash__` — this enforces the invariant that equal objects MUST have
+equal hashes (required for correct dict/set behavior); forgetting this is a
+common bug when people add __eq__ to a class used as a dict key/set member.
+
+================================================================================
+Q23. Iterators and generators
+================================================================================
+ITERATOR PROTOCOL: an object is an iterator if it implements `__next__()`
+(returns the next value, raises StopIteration when exhausted) and
+`__iter__()` (returns itself). An object is ITERABLE if it implements
+`__iter__()` that returns an iterator. A `for x in obj` loop internally calls
+`iter(obj)` once (getting an iterator), then calls `next()` on it repeatedly
+until StopIteration is caught (and silently handled by the loop machinery).
+
+Custom iterator (manual implementation):
+    class Counter:
+        def __init__(self, limit):
+            self.limit = limit
+            self.n = 0
+        def __iter__(self):
+            return self
+        def __next__(self):
+            if self.n >= self.limit:
+                raise StopIteration
+            self.n += 1
+            return self.n
+
+GENERATORS: a much simpler way to get the same iterator behavior. Any
+function containing a `yield` statement automatically becomes a generator
+function — calling it doesn't run the body at all, it returns a generator
+object (which auto-implements __iter__/__next__). Internally, the
+interpreter compiles such functions specially (CO_GENERATOR flag) so that
+calling next() on the generator object resumes execution of that function's
+SAVED FRAME exactly where it last paused at a yield, runs until the next
+yield (or return/end, which raises StopIteration automatically).
+
+    def counter(limit):
+        n = 0
+        while n < limit:
+            n += 1
+            yield n
+
+    for x in counter(3):    # 1, 2, 3 - frame suspends/resumes each iteration
+        print(x)
+
+Generators are memory-efficient (lazy, one value at a time) and are the
+backbone of how `range()`, file iteration, and many standard library
+constructs avoid loading everything into memory upfront.
+
+================================================================================
+Q24. yield vs return
+================================================================================
+`return` exits a function COMPLETELY and permanently — the function's frame
+is destroyed, all local state is lost. Calling the function again starts
+completely fresh from the top.
+
+`yield` PAUSES the function, sending a value out to the caller, but
+PRESERVES the entire local execution state (variables, instruction pointer)
+in the frame. The function can be RESUMED later exactly where it left off
+via next(), continuing with all local variables intact. A function can yield
+multiple times across multiple next() calls; it only truly ends (raising
+StopIteration) when it reaches a `return` (which becomes the
+StopIteration's value) or falls off the end of the function body.
+
+    def gen():
+        print("start")
+        yield 1
+        print("middle")
+        yield 2
+        print("end")
+        return "done"
+
+    g = gen()
+    next(g)   # prints "start", returns 1 - frame paused right after yield 1
+    next(g)   # prints "middle", returns 2 - resumed, paused after yield 2
+    next(g)   # prints "end", raises StopIteration("done") - frame finally destroyed
+
+Key distinction for interviews: a function with ANY yield anywhere in its
+body is a generator function PERIOD — even if there's also a `return`
+elsewhere, presence of yield changes the function's fundamental nature at
+compile time (it gets the CO_GENERATOR flag), so calling it never executes
+the body immediately; it always returns a generator object first.
+
+================================================================================
+Q25. The four pillars of OOP
+================================================================================
+1. Encapsulation — bundling data (attributes) and behavior (methods)
+   together inside a class, and controlling/restricting direct external
+   access to internal state (so the object's internal representation can
+   change without breaking external code that uses it).
+2. Inheritance — a class (child/subclass) can derive attributes/methods from
+   another class (parent/superclass), enabling code reuse and establishing
+   an "is-a" relationship hierarchy.
+3. Polymorphism — objects of different classes can be used through the SAME
+   interface/method call, with each class providing its own specific
+   behavior for that call (e.g. calling `.speak()` on different Animal
+   subclasses gives different sounds, without the calling code needing to
+   know which exact subclass it has).
+4. Abstraction — hiding complex implementation details behind a simpler
+   interface, exposing only what's necessary for the user of the class to
+   interact with it (e.g. you call `driver.click()` without needing to know
+   how Selenium internally sends the WebDriver protocol command over HTTP).
+
+================================================================================
+Q26. Encapsulation with a real example
+================================================================================
+Python doesn't have true private access modifiers enforced by the
+interpreter (unlike Java's private keyword) — it relies on NAMING
+CONVENTIONS plus a name-mangling mechanism for double-underscore attributes.
+
+- `self.attr` — public, freely accessible.
+- `self._attr` — single underscore = "protected by convention" — a signal to
+  other developers "treat this as internal, don't touch it directly", but
+  NOTHING stops external code from accessing it; the interpreter doesn't
+  enforce this at all.
+- `self.__attr` — double underscore (no trailing double underscore)
+  triggers NAME MANGLING: internally Python renames it to
+  `_ClassName__attr` at compile time. This makes accidental external access
+  (and accidental clashes in subclasses using the same name) harder, though
+  it's still technically accessible via the mangled name if someone really
+  wants to (`obj._ClassName__attr`) — so it's "harder to access by
+  accident", not truly private/unbreakable.
+
+Real example — a bank account that prevents the balance from being set to an
+invalid value directly, using a `@property`:
+
+    class BankAccount:
+        def __init__(self, balance):
+            self.__balance = balance     # mangled to _BankAccount__balance
+
+        @property
+        def balance(self):
+            return self.__balance
+
+        @balance.setter
+        def balance(self, value):
+            if value < 0:
+                raise ValueError("Balance cannot be negative")
+            self.__balance = value
+
+    acc = BankAccount(100)
+    acc.balance = 50      # goes through the setter, validated
+    acc.balance = -10     # raises ValueError - direct attribute access is
+                           # blocked from bypassing the validation logic
+
+`@property` itself is built on the descriptor protocol (similar mechanism to
+staticmethod/classmethod) — accessing `acc.balance` actually calls a hidden
+getter method behind the scenes, letting you control attribute access while
+the calling code still uses simple attribute syntax.
+
+================================================================================
+Q27. Inheritance and its types
+================================================================================
+Inheritance lets a class reuse/extend another class's attributes & methods.
+
+    class Animal:
+        def speak(self):
+            return "Some sound"
+
+    class Dog(Animal):           # Dog inherits from Animal
+        def speak(self):         # method overriding
+            return "Bark"
+
+Types:
+1. Single inheritance — one parent, one child (Dog(Animal) above).
+2. Multiple inheritance — a class inherits from MORE THAN ONE parent
+   simultaneously: `class C(A, B):` — C gets attributes/methods from both A
+   and B (resolved via MRO, see Q33).
+3. Multilevel inheritance — a chain: `class C(B): ...; class B(A): ...` — C
+   inherits from B, which inherits from A, so C transitively gets A's
+   members too.
+4. Hierarchical inheritance — multiple child classes inherit from the SAME
+   single parent: `class Dog(Animal): ...; class Cat(Animal): ...`
+5. Hybrid inheritance — any combination of the above patterns mixed
+   together in one class hierarchy.
+
+Internally, when you access `instance.method()`, Python looks up `method`
+first on the instance's own __dict__, then walks the class's MRO (Method
+Resolution Order, a flattened linear list of all ancestor classes computed
+once via the C3 linearization algorithm when the class is defined) in order
+until it finds the attribute defined on some class in that chain — this is
+literally how "inheriting" a method works mechanically: there's no copying
+of code, just a lookup chain.
+
+================================================================================
+Q28. Polymorphism — example using method overriding
+================================================================================
+Polymorphism = same method call, different behavior depending on the actual
+runtime type of the object — achieved in Python via METHOD OVERRIDING
+(subclass redefines a method with the same name/signature as the parent).
+
+    class Shape:
+        def area(self):
+            raise NotImplementedError
+
+    class Circle(Shape):
+        def __init__(self, r):
+            self.r = r
+        def area(self):
+            return 3.1416 * self.r ** 2
+
+    class Rectangle(Shape):
+        def __init__(self, w, h):
+            self.w, self.h = w, h
+        def area(self):
+            return self.w * self.h
+
+    shapes = [Circle(5), Rectangle(3, 4)]
+    for s in shapes:
+        print(s.area())     # calls the CORRECT subclass's area() each time,
+                             # even though the calling code only knows about
+                             # the generic Shape interface
+
+Internal mechanism — this works automatically in Python because of how
+attribute lookup follows the INSTANCE's actual class, not the static/
+declared type of the variable (Python has no static typing enforced at
+runtime by default) — `s.area()` looks up `area` starting from
+`type(s).__mro__`, so each object naturally resolves to ITS OWN class's
+override. This is sometimes called "duck typing" support — Python doesn't
+even require a common base class for polymorphism to work; if an object has
+a matching method, it can be used interchangeably ("if it walks like a duck
+and quacks like a duck...").
+
+In automation: BasePage class with a generic `wait_for_load()`, overridden
+differently per page (LoginPage, DashboardPage) since each page has
+different load-completion criteria, but test code calls `page.wait_for_load()`
+uniformly regardless of which page object it currently holds.
+
+================================================================================
+Q29. Abstraction & the ABC module
+================================================================================
+Abstraction hides implementation complexity behind a simpler interface.
+Python enforces this formally via the `abc` (Abstract Base Class) module.
+
+`ABC` is a special base class (metaclass=ABCMeta under the hood) that lets
+you mark methods with `@abstractmethod` — any subclass that does NOT
+override every abstract method CANNOT BE INSTANTIATED at all; Python raises
+`TypeError: Can't instantiate abstract class ... with abstract method ...`
+at the moment of construction.
+
+    from abc import ABC, abstractmethod
+
+    class PaymentGateway(ABC):
+        @abstractmethod
+        def process_payment(self, amount):
+            ...
+        @abstractmethod
+        def refund(self, transaction_id):
+            ...
+
+    class StripeGateway(PaymentGateway):
+        def process_payment(self, amount):
+            print(f"Processing {amount} via Stripe")
+        def refund(self, transaction_id):
+            print(f"Refunding {transaction_id} via Stripe")
+
+    # PaymentGateway()       # TypeError - abstract class
+    gw = StripeGateway()     # OK - all abstract methods implemented
+    gw.process_payment(100)
+
+Internal mechanism: `ABCMeta` (the metaclass `ABC` uses) overrides
+`__new__` for classes — at CLASS CREATION time, it scans the class for
+methods still marked with `__isabstractmethod__ = True` that aren't
+overridden, collects them into `__abstractmethods__`, and at INSTANTIATION
+time (`object.__new__`), it checks if that frozenset is non-empty and raises
+TypeError if so. This is enforced by the interpreter itself, unlike plain
+"NotImplementedError in base method" conventions which only fail at
+RUNTIME when the method is actually CALLED (not at instantiation) — ABC
+catches the mistake earlier.
+
+In automation, this pattern enforces that every Page Object class MUST
+implement required methods (e.g. `is_loaded()`), catching incomplete page
+object implementations immediately rather than failing mysteriously deep
+into a test run.
+
+================================================================================
+Q30. Method overloading — why Python doesn't support it directly
+================================================================================
+Method overloading (in Java/C++) = defining MULTIPLE methods with the SAME
+NAME but different parameter signatures (different number/types of args),
+and the compiler picks the right one at compile time based on argument
+types — this requires STATIC TYPE information available at compile time.
+
+Python is dynamically typed and doesn't do compile-time type resolution of
+calls at all — it has just ONE namespace per class, so defining the same
+method name twice simply makes the SECOND definition silently OVERWRITE the
+first in the class's __dict__ (no error, no overload resolution — the first
+def is just gone):
+
+    class Calc:
+        def add(self, a, b):
+            return a + b
+        def add(self, a, b, c):     # this REPLACES the previous add entirely
+            return a + b + c
+
+    Calc().add(1, 2)        # TypeError - missing required arg 'c'!
+                             # the 2-arg version no longer exists
+
+Python achieves similar flexibility WITHOUT true overloading via:
+1. Default arguments: `def add(self, a, b, c=0): return a+b+c`
+2. *args/**kwargs for variable arity (Q4).
+3. `functools.singledispatch` for genuine type-based overload-like dispatch:
+    from functools import singledispatch
+    @singledispatch
+    def process(arg):
+        print("default", arg)
+    @process.register(int)
+    def _(arg):
+        print("int handling", arg)
+    @process.register(str)
+    def _(arg):
+        print("str handling", arg)
+    # process(5) -> int handling, process("x") -> str handling
+
+================================================================================
+Q31. super() vs direct parent class calls
+================================================================================
+Both can call a parent's method from a subclass, but they behave very
+differently with MULTIPLE INHERITANCE.
+
+Direct call: `Parent.method(self, ...)` — explicitly calls THAT exact named
+class's method, bypassing the MRO entirely. Works fine for simple single
+inheritance but BREAKS cooperative multiple inheritance — if there are
+diamond-shaped hierarchies, direct calls can cause a grandparent method to
+be called multiple times or skipped.
+
+`super()` — does NOT mean "my direct parent" literally; it means "the NEXT
+class in the MRO after the current class, for THIS instance". This is the
+crucial nuance: super()'s behavior depends on the FULL MRO of
+`type(self)`, not just the class where the code is written — making it
+"cooperative": each class's super().__init__() call passes control along
+the chain exactly once, in the correct linearized order, even in diamond
+multiple-inheritance graphs.
+
+    class A:
+        def greet(self):
+            print("A")
+
+    class B(A):
+        def greet(self):
+            super().greet()    # calls next in MRO after B, for self's actual type
+            print("B")
+
+    class C(A):
+        def greet(self):
+            super().greet()
+            print("C")
+
+    class D(B, C):
+        def greet(self):
+            super().greet()
+            print("D")
+
+    D().greet()
+    # MRO of D is [D, B, C, A, object]
+    # Output: A, C, B, D  <- A is called ONLY ONCE even though both B and C
+    #                        descend from it, because super() follows the
+    #                        single linearized MRO, not naive "call my
+    #                        direct parent" recursion which would call A twice
+
+Rule of thumb: always prefer `super()` in cooperative class hierarchies;
+use direct parent calls only in simple, non-multiple-inheritance code where
+you specifically need to bypass the MRO (rare, intentional edge cases).
+
+================================================================================
+Q32. Dunder / magic methods
+================================================================================
+Dunder methods (double underscore, e.g. __init__) let your custom classes
+hook into Python's built-in syntax/operators/functions — this is how
+Python implements operator overloading and protocol support consistently
+across both built-in and user-defined types.
+
+__str__(self): called by `str(obj)` and `print(obj)` — should return a
+human-readable string.
+__repr__(self): called by `repr(obj)` and shown in the interactive shell/
+debugger — should return an unambiguous, ideally code-like representation
+(`eval(repr(obj))` should ideally reconstruct an equal object). If __str__
+is not defined, Python falls back to __repr__ for print() too.
+__len__(self): called by `len(obj)` — must return a non-negative int.
+__eq__, __lt__, __gt__, etc.: comparison operators.
+__add__, __sub__, __mul__: arithmetic operators (`a + b` calls `a.__add__(b)`).
+__getitem__/__setitem__: enables `obj[key]` / `obj[key]=value` indexing
+syntax (this is literally how list/dict indexing AND custom container
+classes both work — same protocol).
+__iter__/__next__: makes an object iterable (Q23).
+__enter__/__exit__: makes an object usable as a context manager (Q37/38).
+__call__: makes instances callable like functions (`obj()`).
+
+Example:
+    class Point:
+        def __init__(self, x, y):
+            self.x, self.y = x, y
+        def __repr__(self):
+            return f"Point({self.x}, {self.y})"
+        def __eq__(self, other):
+            return self.x == other.x and self.y == other.y
+        def __add__(self, other):
+            return Point(self.x + other.x, self.y + other.y)
+
+    p1, p2 = Point(1,2), Point(3,4)
+    print(p1 + p2)     # Point(4, 6) - uses __add__ then __repr__ for printing
+
+Internally, operators don't special-case user classes at all — `a + b`
+ALWAYS compiles to a `BINARY_ADD` bytecode that looks up `__add__` on the
+operand's type, whether that operand is a built-in int or your custom class
+— total consistency between built-in and user types is the whole point of
+the dunder protocol design.
+
+================================================================================
+Q33. Multiple inheritance and MRO (Method Resolution Order)
+================================================================================
+Multiple inheritance: `class D(B, C):` — D inherits from both B and C.
+
+The problem this creates: if both B and C define the same method name (or
+both ultimately inherit from a common ancestor A — the "diamond problem"),
+which version does `D().method()` actually call, and in what order should
+ancestors be visited?
+
+Python solves this with the MRO, computed using the C3 LINEARIZATION
+algorithm (the same algorithm used by some other languages with multiple
+inheritance) when the class is defined. The MRO is a single deterministic,
+LINEAR ordering of all ancestor classes that respects two rules:
+1. A class always appears before its own parents (local precedence).
+2. The relative order in which parent classes were listed in the class
+   definition is preserved.
+You can inspect it directly: `D.__mro__` or `D.mro()`.
+
+    class A: pass
+    class B(A): pass
+    class C(A): pass
+    class D(B, C): pass
+    print(D.__mro__)
+    # (D, B, C, A, object) - this exact order is what super() (Q31) walks
+    # through, and what attribute lookup uses to resolve obj.method()
+
+If C3 linearization can't produce a CONSISTENT ordering for a given class
+hierarchy (a genuinely contradictory inheritance order), Python raises
+`TypeError: Cannot create a consistent method resolution order` at class
+DEFINITION time, before you even instantiate anything.
+
+Why this matters practically: attribute/method lookup on any instance
+literally walks this precomputed MRO tuple in order and returns the first
+match — that's the entire mechanism behind "inheriting" something in
+Python, for both single AND multiple inheritance.
+
+================================================================================
+Q34. Abstract class vs Interface in Python
+================================================================================
+Python has no separate `interface` keyword (unlike Java) — the same `ABC`
+mechanism (Q29) is used to express both concepts; the distinction is more
+about INTENT/convention than enforced language syntax:
+
+Abstract class: typically provides a MIX of abstract methods (must be
+implemented by subclass) AND some concrete/shared implementation (real
+method bodies that subclasses inherit as-is) AND possibly shared state/
+attributes. Represents a partial implementation meant to be extended.
+
+    class BasePage(ABC):
+        def __init__(self, driver):
+            self.driver = driver        # shared concrete state
+        def open(self, url):            # shared concrete method
+            self.driver.get(url)
+        @abstractmethod
+        def is_loaded(self):            # subclass MUST implement
+            ...
+
+"Interface" (by convention in Python): an ABC where EVERY method is
+abstract — pure contract, no shared implementation or state at all,
+purely defining "any class implementing this MUST provide these methods."
+
+    class Clickable(ABC):
+        @abstractmethod
+        def click(self): ...
+        @abstractmethod
+        def is_enabled(self): ...
+
+Python also supports a more lightweight, structural alternative:
+`typing.Protocol` (PEP 544) — defines an interface based on STRUCTURE
+(duck typing) rather than explicit inheritance: any class that happens to
+have matching method signatures satisfies the Protocol for static type
+checkers (mypy), WITHOUT needing to explicitly inherit from it at all —
+closer to how Go interfaces work, as opposed to Java-style explicit
+"implements" inheritance.
+
+================================================================================
+Q35. File operations (read / write / append)
+================================================================================
+    # Read entire file
+    with open("data.txt", "r") as f:
+        content = f.read()
+
+    # Read line by line (memory efficient - file objects are iterators
+    # internally, reading one line at a time via buffered I/O, not loading
+    # the whole file into memory)
+    with open("data.txt", "r") as f:
+        for line in f:
+            print(line.strip())
+
+    # Write (TRUNCATES/overwrites existing content first)
+    with open("data.txt", "w") as f:
+        f.write("Hello\n")
+
+    # Append (adds to end, doesn't touch existing content)
+    with open("data.txt", "a") as f:
+        f.write("New line\n")
+
+    # Read + Write without truncating
+    with open("data.txt", "r+") as f:
+        ...
+
+Mode flags: 'r' read, 'w' write(truncate), 'a' append, 'x' exclusive create
+(fails if file exists), 'b' suffix for binary mode (e.g. 'rb'), '+' for
+read/write combined. Default mode if omitted is 'rt' (read, text).
+
+Internally, `open()` returns a buffered I/O object (a wrapper layering
+TextIOWrapper -> BufferedReader/Writer -> raw FileIO) — Python doesn't make
+a system call to the OS for every single .read()/.write() call; it buffers
+data in memory and flushes to disk in larger chunks for efficiency, which is
+WHY `with` (context manager, Q37) matters so much here — exiting the with
+block calls `f.close()` which both releases the OS file descriptor AND
+flushes any buffered-but-unwritten data to disk; forgetting to close (if not
+using `with`) can mean data sits in the buffer and never actually reaches
+the disk if the program crashes/exits abnormally.
+
+================================================================================
+Q36. == vs is when comparing OBJECTS specifically
+================================================================================
+(Builds on Q8/Q22, applied specifically to custom class instances.)
+
+For custom objects, `==` uses `__eq__` (value-based comparison logic YOU
+define), while `is` ALWAYS checks raw memory identity regardless of any
+__eq__ override — `is` cannot be overridden/customized at all, it's a
+fixed CPython-level pointer comparison (literally `id(a) == id(b)`, and
+id() in CPython IS the object's memory address for the lifetime of that
+object).
+
+    class Config:
+        def __init__(self, env):
+            self.env = env
+        def __eq__(self, other):
+            return self.env == other.env
+
+    c1 = Config("prod")
+    c2 = Config("prod")
+    c3 = c1
+
+    print(c1 == c2)   # True  - same env value, via our __eq__
+    print(c1 is c2)   # False - two distinct objects in memory
+    print(c1 is c3)   # True  - c3 is literally the same object as c1
+
+Practical guidance: use `==` for almost all comparisons in business/test
+logic (comparing expected vs actual values in assertions). Reserve `is`
+specifically for: comparing against `None`/`True`/`False` singletons, or
+deliberately checking "is this literally the same object" (e.g., checking
+if a cached/singleton instance was reused rather than recreated).
+
+================================================================================
+Q37. Exception chaining and custom exceptions
+================================================================================
+CUSTOM EXCEPTIONS: define your own exception types by subclassing
+`Exception` (or a more specific built-in subclass) — lets calling code catch
+YOUR specific error type distinctly from generic errors, and lets you attach
+extra context/data to the exception object itself.
+
+    class ElementNotInteractableError(Exception):
+        def __init__(self, locator, message="Element not interactable"):
+            self.locator = locator
+            super().__init__(f"{message}: {locator}")
+
+    raise ElementNotInteractableError(locator="#submit-btn")
+
+EXCEPTION CHAINING: when you catch one exception and raise a DIFFERENT one
+in response, Python lets you preserve the ORIGINAL exception as context
+using `raise NewException(...) from original_exception` — this sets the new
+exception's `__cause__` attribute to the original, and the traceback printed
+will show BOTH exceptions chained together ("The above exception was the
+direct cause of the following exception") instead of losing the root cause.
+
+    try:
+        response = api_call()
+    except requests.ConnectionError as e:
+        raise ServiceUnavailableError("Could not reach payment API") from e
+
+Without explicit `from e`, Python STILL auto-chains via `__context__`
+(implicit chaining) whenever a new exception is raised WHILE handling
+another one inside an except block — but explicit `from e` clearly states
+"this new exception was deliberately caused by that other one," giving a
+cleaner/more intentional traceback, vs implicit chaining which can look like
+an accidental secondary failure during error handling.
+
+`raise NewException(...) from None` explicitly SUPPRESSES the chain display
+entirely, if you genuinely want to hide the original cause from the
+traceback.
+
+================================================================================
+Q38. Function vs Method
+================================================================================
+A FUNCTION is a standalone callable, defined independently, not bound to any
+class/object: `def add(a, b): return a+b`.
+
+A METHOD is a function defined INSIDE a class — when accessed through an
+INSTANCE, it automatically becomes a "bound method": a special wrapper
+object that remembers the instance and auto-supplies it as the first
+argument (`self`) whenever called.
+
+    class Calculator:
+        def add(self, a, b):
+            return a + b
+
+    calc = Calculator()
+    print(calc.add)          # <bound method Calculator.add of <...>>
+    print(calc.add(2, 3))    # 5 - 'calc' was automatically passed as self
+
+    print(Calculator.add)            # plain function, NOT bound
+    print(Calculator.add(calc, 2, 3))  # 5 - same call, self passed manually
+
+Internal mechanism (the descriptor protocol again, tying back to Q17): a
+plain function object is itself a descriptor — it implements `__get__`.
+When you access `instance.method_name`, Python doesn't just fetch the
+function from the class's __dict__ and hand it back as-is; it calls the
+function's `__get__(instance, owner_class)`, which returns a NEW
+"bound method" object wrapping both the function and the instance. THIS
+bound method object is what makes `self` get passed automatically — it's
+not special syntax, it's the descriptor protocol firing during normal
+attribute lookup. Accessed via the CLASS itself (not an instance), no
+binding happens — you just get the plain underlying function back, which is
+why you must pass self explicitly in `Calculator.add(calc, 2, 3)`.
+
+================================================================================
+Q39. The `with` statement and context managers
+================================================================================
+`with` guarantees that SETUP and CLEANUP code run reliably around a block of
+code, even if an exception occurs partway through — eliminating the need for
+manual try/finally boilerplate for common "acquire resource, use it,
+release resource" patterns (files, DB connections, locks, WebDriver
+sessions).
+
+    with open("file.txt") as f:
+        data = f.read()
+    # f.close() is GUARANTEED to run here, even if read() raised an exception
+
+Internal mechanism — the CONTEXT MANAGER PROTOCOL: `with expr as var:`
+compiles (roughly) to:
+
+    mgr = expr
+    var = mgr.__enter__()
+    try:
+        # the with-block body
+        ...
+    finally:
+        mgr.__exit__(exc_type, exc_value, traceback)
+
+`__enter__()` runs at the start of the block and its return value is bound
+to `var` (e.g. the file object itself, for `open()`). `__exit__()` ALWAYS
+runs when the block ends — whether normally or via an exception — and
+receives the exception info (type/value/traceback) if one occurred, or
+(None, None, None) otherwise. If `__exit__` returns a truthy value, the
+exception is SUPPRESSED (treated as handled, doesn't propagate further) —
+this is a powerful, sometimes surprising detail: a context manager can
+silently swallow exceptions if its __exit__ explicitly returns True.
+
+Real Selenium-flavored use: ensuring `driver.quit()` always runs even if a
+test step throws, instead of leaving orphaned browser processes after a
+failed test.
+
+================================================================================
+Q40. Creating a custom context manager
+================================================================================
+Two ways to build one:
+
+METHOD 1 — class-based, implementing __enter__/__exit__ explicitly (full
+control, useful when you need to inspect the exception in __exit__):
+
+    class WebDriverSession:
+        def __init__(self, browser="chrome"):
+            self.browser = browser
+            self.driver = None
+        def __enter__(self):
+            self.driver = create_driver(self.browser)   # setup
+            return self.driver                            # bound to 'as' var
+        def __exit__(self, exc_type, exc_value, tb):
+            self.driver.quit()                            # cleanup, ALWAYS runs
+            if exc_type is not None:
+                logger.error(f"Test failed with {exc_type}: {exc_value}")
+            return False    # False/None = don't suppress the exception,
+                             # let it propagate normally after cleanup
+
+    with WebDriverSession("chrome") as driver:
+        driver.get("https://example.com")
+        # even if an assertion fails here, __exit__ still runs and quits driver
+
+METHOD 2 — function-based, using `@contextlib.contextmanager` (less
+boilerplate, uses a generator function where the code BEFORE `yield` is the
+setup/__enter__ logic, the yielded value becomes the `as` variable, and the
+code AFTER yield — placed inside a try/finally — is the cleanup/__exit__
+logic):
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def webdriver_session(browser="chrome"):
+        driver = create_driver(browser)
+        try:
+            yield driver           # this is what 'as driver' receives
+        finally:
+            driver.quit()          # runs on exit, exception or not
+
+    with webdriver_session("chrome") as driver:
+        driver.get("https://example.com")
+
+Internally, `@contextmanager` works by wrapping the generator in a helper
+class whose `__enter__` calls `next(gen)` once (running up to the yield) and
+whose `__exit__` calls `next(gen)` again (or `gen.throw(...)` if there was
+an exception, injecting it AT the yield point inside the generator so your
+`finally` block there handles it) — bridging the generator/yield mechanism
+(Q23/24) into the formal context manager protocol (Q39) automatically.
+
+================================================================================
+END OF DOCUMENT
+================================================================================
